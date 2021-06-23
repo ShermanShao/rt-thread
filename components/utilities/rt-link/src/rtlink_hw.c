@@ -183,11 +183,10 @@ rt_uint32_t rt_link_get_crc(rt_uint8_t using_buffer_ring, rt_uint8_t *data, rt_s
     return crc32;
 }
 
-rt_err_t rt_link_hw_send(void *data, rt_size_t length)
+rt_size_t rt_link_hw_send(void *data, rt_size_t length)
 {
     rt_size_t send_len = 0;
     send_len = rt_link_port_send(data, length);
-    LOG_D("hw_send len= %d", send_len);
     return send_len;
 }
 
@@ -220,11 +219,17 @@ rt_err_t rt_link_hw_init(void)
     scb->rx_buffer = rx_buffer;
     scb->calculate_crc = rt_link_get_crc;
 
-    rt_link_port_init();
+    if(RT_EOK != rt_link_port_init())
+    {
+        return -RT_ERROR;
+    }
 
 #ifdef LINK_LAYER_USING_HW_CRC
     /* crc hardware device for mcu and node */
-    rt_link_hw_crc32_init();
+    if(RT_EOK != rt_link_hw_crc32_init())
+    {
+        return -RT_ERROR;
+    }
 #endif
 
     LOG_I("link layer hardware environment init successful.");
@@ -244,11 +249,17 @@ rt_err_t rt_link_hw_deinit(void)
         scb->rx_buffer = rx_buffer;
         scb->calculate_crc = RT_NULL;
     }
-    rt_link_port_deinit();
+    if(RT_EOK != rt_link_port_deinit())
+    {
+        return -RT_ERROR;
+    }
 
 #ifdef LINK_LAYER_USING_HW_CRC
     /* crc hardware device for mcu and node */
-    rt_link_hw_crc32_deinit();
+    if(RT_EOK != rt_link_hw_crc32_deinit())
+    {
+        return -RT_ERROR;
+    }
 #endif
 
     LOG_I("rtlink hardware deinit successful.");

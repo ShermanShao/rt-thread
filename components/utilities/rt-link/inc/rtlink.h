@@ -16,27 +16,27 @@
 
 #define RT_LINK_AUTO_INIT
 
-#define RT_LINK_FRAME_HEAD                 0x15
-#define RT_LINK_FRAME_HEAD_MASK            0x1F
-#define RT_LINK_MAX_DATA_LENGTH            2044 /*can exact divide by 4 bytes*/
-#define RT_LINK_FRAMES_MAX   0x03   /* The maximum number of split frames for a long package*/
+#define RT_LINK_FRAME_HEAD              0x15
+#define RT_LINK_FRAME_HEAD_MASK         0x1F
+#define RT_LINK_MAX_FRAME_LENGTH        1024 /*can exact divide by 4 bytes*/
+#define RT_LINK_FRAMES_MAX      0x03 /* The maximum number of split frames for a long package*/
 
-#define RT_LINK_ACK_MAX   0x07
-#define RT_LINK_CRC_LENGTH          4
-#define RT_LINK_HEAD_LENGTH         4
+#define RT_LINK_ACK_MAX     0x07
+#define RT_LINK_CRC_LENGTH      4
+#define RT_LINK_HEAD_LENGTH     4
 #define RT_LINK_MAX_EXTEND_LENGTH       4
-#define RT_LINK_MAX_FRAME_LENGTH        (RT_LINK_HEAD_LENGTH + RT_LINK_MAX_EXTEND_LENGTH + RT_LINK_MAX_DATA_LENGTH + RT_LINK_CRC_LENGTH)
+#define RT_LINK_MAX_DATA_LENGTH     (RT_LINK_MAX_FRAME_LENGTH - RT_LINK_HEAD_LENGTH - RT_LINK_MAX_EXTEND_LENGTH - RT_LINK_CRC_LENGTH)
 #define RT_LINK_RECEIVE_BUFFER_LENGTH       (RT_LINK_MAX_FRAME_LENGTH * RT_LINK_FRAMES_MAX + RT_LINK_HEAD_LENGTH + RT_LINK_MAX_EXTEND_LENGTH)
 
 typedef enum
 {
     RT_LINK_SERVICE_RTLINK = 0,
-    RT_LINK_SERVICE_LINK_SOCKET = 1,
-    RT_LINK_SERVICE_LINK_WIFI = 2,
-    RT_LINK_SERVICE_LINK_MNGT = 3,
-    RT_LINK_SERVICE_LINK_MSHTOOLS = 4,
-    RT_LINK_SERVICE_MAX
-} rt_link_service_t;
+    RT_LINK_SERVICE_SOCKET = 1,
+    RT_LINK_SERVICE_WIFI = 2,
+    RT_LINK_SERVICE_MNGT = 3,
+    RT_LINK_SERVICE_MSHTOOLS = 4,
+    RT_LINK_SERVICE_MAX /* Expandable to a maximum of 31 */
+} rt_link_service_e;
 
 enum
 {
@@ -56,7 +56,7 @@ typedef enum
     RT_LINK_SESSION_END,  /* The retring failed to end the session */
 
     RT_LINK_HANDSHAKE_FRAME
-} rt_link_frame_attribute_t;
+} rt_link_frame_attr_e;
 
 typedef enum
 {
@@ -70,21 +70,36 @@ typedef enum
     RT_LINK_SEND_OK_EVENT       = 1 << 5,
     RT_LINK_SEND_FAILED_EVENT   = 1 << 6,
     RT_LINK_SEND_TIMEOUT_EVENT  = 1 << 7
-} rt_link_notice_t;
+} rt_link_notice_e;
 
 typedef enum
 {
     RT_LINK_ESTABLISHING = 0,
     RT_LINK_NO_RESPONSE,
     RT_LINK_CONNECT_DONE,
-} rt_link_linkstatus_t;
+} rt_link_linkstatus_e;
 
 typedef enum
 {
     RECVTIMER_NONE = 0,
     RECVTIMER_FRAME,
     RECVTIMER_LONGFRAME
-} rt_link_recvtimer_status_t;
+} rt_link_recvtimer_status_e;
+
+typedef enum
+{
+    RT_LINK_EOK = 0,
+    RT_LINK_ERR = 1,
+    RT_LINK_ETIMEOUT = 2,
+    RT_LINK_EFULL = 3, 
+    RT_LINK_EEMPTY = 4,
+    RT_LINK_ENOMEM = 5,
+    RT_LINK_EIO = 6,
+    RT_LINK_ESESSION = 7,
+    RT_LINK_ESERVICE = 8,
+
+    RT_LINK_EMAX
+}rt_link_err_e;
 
 struct rt_link_receive_buffer
 {
@@ -101,7 +116,7 @@ struct rt_link_frame_head
     rt_uint8_t crc     : 1;
     rt_uint8_t ack     : 1;
     rt_uint8_t sequence;
-    rt_uint16_t channel: 5;
+    rt_uint16_t service: 5;
     rt_uint16_t length : 11;
 };
 
@@ -116,7 +131,7 @@ struct rt_link_record
 
 struct rt_link_extend
 {
-    rt_uint16_t attribute;           /* rt_link_frame_attribute_t */
+    rt_uint16_t attribute;           /* rt_link_frame_attr_e */
     rt_uint16_t parameter;
 };
 
@@ -128,7 +143,7 @@ struct rt_link_frame
     rt_uint32_t crc;                        /* CRC result */
 
     rt_uint16_t data_len;         /* the length of frame length */
-    rt_uint16_t attribute;        /* this will show frame attribute , rt_link_frame_attribute_t */
+    rt_uint16_t attribute;        /* this will show frame attribute , rt_link_frame_attr_e */
 
     rt_uint8_t index;              /* the index frame for long frame */
     rt_uint8_t total;               /* the total frame for long frame */
@@ -138,19 +153,25 @@ struct rt_link_frame
 
 struct rt_link_service
 {
-    rt_err_t (*upload_callback)(void *data, rt_size_t size);
+    void (*send_cb)(struct rt_link_service* service, void* buffer);
+    void (*recv_cb)(struct rt_link_service* service, void *data, rt_size_t size);
+
+    rt_int32_t timeout_tx;
+    void* user_data;
+
+    rt_link_err_e err;
+    rt_link_service_e service;
 };
 
 struct rt_link_session
 {
-    rt_link_linkstatus_t link_status;   /* Link connection status*/
-    struct rt_event event;      /* the event that core logic */
-    struct rt_link_service channel[RT_LINK_SERVICE_MAX]; /* thansfer to app layer */
+    struct rt_event event;      /* Drives the core thread to runing */
+    struct rt_link_service *service[RT_LINK_SERVICE_MAX]; /* The service transport channel */
 
     rt_slist_t tx_data_slist;
-    rt_uint8_t tx_seq;     /* sequence for frame */
-    struct rt_mutex tx_lock;    /* protect send data interface, only one thread can hold it */
-    struct rt_timer sendtimer;  /* send function timer for rt link */
+    rt_uint8_t tx_seq;     /* The data frame sequence number, which represents the confirmed data frame number */
+    struct rt_event sendevent;  /*  */
+    struct rt_timer sendtimer;  /* send timer for rt-link */
 
     struct rt_link_record rx_record;    /* the memory of receive status */
     struct rt_timer recvtimer;          /* receive a frame timer for rt link */
@@ -158,16 +179,20 @@ struct rt_link_session
 
     struct rt_link_receive_buffer *rx_buffer; /* the buffer will store data */
     rt_uint32_t (*calculate_crc)(rt_uint8_t using_buffer_ring, rt_uint8_t *data, rt_size_t size); /* this function will calculate crc */
+    rt_link_linkstatus_e link_status;   /* Link connection status*/
 };
 
-/* rtlink init and deinit */
+#define SERV_ERR_GET(service)   (service->err)
+
+/* rtlink init and deinit, default is automatic initialization*/
 int rt_link_init(void);
 rt_err_t rt_link_deinit(void);
-/* rtlink send data interface */
-rt_size_t rt_link_send(rt_link_service_t service, void *data, rt_size_t size);
+
+rt_size_t rt_link_send(struct rt_link_service *service, const void *data, rt_size_t size);
+
 /* rtlink service attach and detach */
-rt_err_t rt_link_service_attach(rt_link_service_t service, rt_err_t (*function)(void *data, rt_size_t size));
-rt_err_t rt_link_service_detach(rt_link_service_t service);
+rt_err_t rt_link_service_attach(struct rt_link_service *service);
+rt_err_t rt_link_service_detach(struct rt_link_service *service);
 
 /* Private operator function */
 struct rt_link_session *rt_link_get_scb(void);

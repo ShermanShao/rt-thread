@@ -43,8 +43,8 @@
 
 #define RT_LINK_THREAD_NAME "rtlink"
 #define RT_LINK_THREAD_TICK    20
-#define RT_LINK_THREAD_PRIORITY    15
-#define RT_LINK_THREAD_STACK_SIZE      832 /* 32 bytes aligned */
+#define RT_LINK_THREAD_PRIORITY    25
+#define RT_LINK_THREAD_STACK_SIZE      1024//832 /* 32 bytes aligned */
 
 typedef enum
 {
@@ -124,6 +124,62 @@ static rt_err_t rt_link_frame_free(struct rt_link_frame *frame)
     return RT_EOK;
 }
 
+/* Configure the extended field of the frame */
+static rt_err_t rt_link_frame_extend_config(struct rt_link_frame *frame, rt_link_frame_attr_e attribute, rt_uint16_t parameter)
+{
+    frame->head.extend = 1;
+    frame->extend.attribute = attribute;
+    frame->extend.parameter = parameter;
+    return RT_EOK;
+}
+
+static int rt_link_command_frame_send(rt_uint8_t sequence, rt_link_frame_attr_e attribute, rt_uint16_t parameter)
+{
+    struct rt_link_frame command_frame = {0};
+    rt_uint8_t extend_flag = RT_FALSE;
+    rt_uint8_t data[sizeof(command_frame.head) + sizeof(command_frame.extend)] = {0};
+    rt_uint8_t data_len = 0;
+
+    /* command frame don't need crc and ack ability */
+    rt_link_frame_init(&command_frame, RT_NULL);
+    data_len += sizeof(command_frame.head);
+
+    command_frame.head.sequence = sequence;
+    command_frame.head.service = RT_LINK_SERVICE_RTLINK;
+    command_frame.total = 1;
+    command_frame.index = 0;
+    command_frame.attribute = attribute;
+    switch (attribute)
+    {
+    case RT_LINK_RESEND_FRAME:
+        extend_flag = RT_TRUE;
+        LOG_D("send RESEND_FRAME(%d).", command_frame.head.sequence);
+        break;
+
+    case RT_LINK_HANDSHAKE_FRAME:
+        extend_flag = RT_TRUE;
+        LOG_D("send HANDSHAKE_FRAME(%d).", command_frame.head.sequence);
+        break;
+
+    case RT_LINK_CONFIRM_FRAME:
+        LOG_D("send CONFIRM_FRAME(%d).", command_frame.head.sequence);
+        break;
+
+    default:
+        break;
+    }
+    if (extend_flag)
+    {
+        rt_link_frame_extend_config(&command_frame, attribute, parameter);
+        rt_memcpy(data + data_len, &command_frame.extend, sizeof(command_frame.extend));
+        data_len += sizeof(command_frame.extend);
+    }
+    rt_memcpy(data, &command_frame.head, sizeof(command_frame.head));
+
+    rt_link_hw_send(data, data_len);
+    return RT_EOK;
+}
+
 /* performs data transmission */
 static rt_err_t rt_link_frame_send(rt_slist_t *slist)
 {
@@ -131,6 +187,7 @@ static rt_err_t rt_link_frame_send(rt_slist_t *slist)
     rt_uint8_t *origin_data = RT_NULL;
     rt_uint8_t *data = RT_NULL;
     rt_size_t length = 0;
+    rt_size_t result = 0;
     rt_uint8_t send_max = RT_LINK_ACK_MAX;  /* The number of '1' in the binary number */
 
     /* if slist is tx_data_slist, we should send all data on the slist*/
@@ -146,7 +203,7 @@ static rt_err_t rt_link_frame_send(rt_slist_t *slist)
     data = rt_malloc(RT_LINK_MAX_FRAME_LENGTH);
     if (data == RT_NULL)
     {
-        LOG_E("rt link alloc memory(%d B) failed, send frame failed.", RT_LINK_MAX_FRAME_LENGTH);
+        LOG_E("Frame sending allocation memory (d B) failed", RT_LINK_MAX_FRAME_LENGTH);
         return -RT_ENOMEM;
     }
     origin_data = data;
@@ -156,6 +213,13 @@ static rt_err_t rt_link_frame_send(rt_slist_t *slist)
         /* get frame for send */
         frame = rt_container_of(slist, struct rt_link_frame, slist);
         slist = rt_slist_next(slist);
+
+        /* If the data that has not yet been sent is removed from the list, the tx_seq needs to be updated */
+        if(rt_link_scb->tx_seq != (frame->head.sequence - frame->index - 1))
+        {
+            rt_link_scb->tx_seq = frame->head.sequence - frame->index - 1;
+            rt_link_command_frame_send(rt_link_scb->tx_seq, RT_LINK_HANDSHAKE_FRAME, rt_link_scb->rx_record.rx_seq);
+        }
 
         length = RT_LINK_HEAD_LENGTH;
         if (frame->head.crc)
@@ -188,14 +252,21 @@ static rt_err_t rt_link_frame_send(rt_slist_t *slist)
         }
 
         LOG_D("frame send(%d) len(%d) attr:(%d), crc:(0x%08x).", frame->head.sequence, length, frame->attribute, frame->crc);
-        rt_link_hw_send(origin_data, length);
+        result = rt_link_hw_send(origin_data, length);
+        if(result == 0)
+        {
+            rt_link_scb->service[frame->head.service]->err = RT_LINK_EIO;
+        }
 
         data = origin_data;
-        if (slist == RT_NULL)
+        if ((slist == RT_NULL) || (frame->index + 1 >= frame->total))
         {
             send_max = 0;
         }
-        send_max >>= 1;
+        else
+        {
+            send_max >>= 1;
+        }
     }while (send_max);
     rt_free(origin_data);
     return RT_EOK;
@@ -220,51 +291,57 @@ static rt_err_t rt_link_frame_stop_receive(struct rt_link_frame *frame)
     return RT_EOK;
 }
 
-/* Configure the extended field of the frame */
-static rt_err_t rt_link_frame_extend_config(struct rt_link_frame *frame, rt_link_frame_attribute_t attribute, rt_uint16_t parameter)
+/* remove the sending list node*/
+static void rt_link_frame_remove(struct rt_link_service *service)
 {
-    frame->head.extend = 1;
-    frame->extend.attribute = attribute;
-    frame->extend.parameter = parameter;
-    return RT_EOK;
+    RT_ASSERT(service != RT_NULL);
+    LOG_D("remove %d",service->service);
+    struct rt_link_frame *find_frame = RT_NULL;
+    rt_uint8_t total = 0;
+    rt_slist_t *tem_list = rt_slist_first(&rt_link_scb->tx_data_slist);
+    if (tem_list != RT_NULL)
+    {
+        do
+        {
+            find_frame = rt_container_of(tem_list, struct rt_link_frame, slist);
+            tem_list = rt_slist_next(tem_list);
+            total = find_frame->total;
+            if(find_frame->head.service == service->service)
+            {
+            /* The data frame order is appended to the list, 
+            with total counting starting at 1 and index counting from 0 */
+                rt_enter_critical();
+                rt_slist_remove(&rt_link_scb->tx_data_slist, &find_frame->slist);
+                rt_exit_critical();
+                find_frame->real_data = RT_NULL;
+                rt_link_frame_free(find_frame);
+                total--;
+            }
+        } while ((total > 0) && (tem_list != RT_NULL));
+    }
 }
 
-static int rt_link_command_frame_send(rt_uint8_t sequence, rt_link_frame_attribute_t attribute, rt_uint16_t parameter)
+static void rt_link_service_send_finish(rt_link_err_e err)
 {
-    struct rt_link_frame command_frame = {0};
-    rt_uint8_t extend_flag = RT_FALSE;
-
-    /* command frame don't need crc and ack ability */
-    rt_link_frame_init(&command_frame, RT_NULL);
-    command_frame.head.sequence = sequence;
-    command_frame.head.length = RT_LINK_MAX_EXTEND_LENGTH;
-    command_frame.attribute = attribute;
-    switch (attribute)
+    struct rt_link_frame *frame = RT_NULL;
+    rt_slist_t *tem_list = rt_slist_first(&rt_link_scb->tx_data_slist);
+    if(tem_list == RT_NULL)
     {
-    case RT_LINK_RESEND_FRAME:
-        extend_flag = RT_TRUE;
-        LOG_D("send RESEND_FRAME(%d).", command_frame.head.sequence);
-        break;
-
-    case RT_LINK_HANDSHAKE_FRAME:
-        extend_flag = RT_TRUE;
-        LOG_D("send HANDSHAKE_FRAME(%d).", command_frame.head.sequence);
-        break;
-
-    case RT_LINK_CONFIRM_FRAME:
-        LOG_D("send CONFIRM_FRAME(%d).", command_frame.head.sequence);
-        break;
-
-    default:
-        break;
+        return ;
     }
-
-    if (extend_flag)
+    frame = rt_container_of(tem_list, struct rt_link_frame, slist);
+    rt_link_scb->service[frame->head.service]->err = err;
+    rt_link_scb->sendtimer.parameter = 0;
+    if(rt_link_scb->service[frame->head.service]->timeout_tx != 0)
     {
-        rt_link_frame_extend_config(&command_frame, attribute, parameter);
+        rt_event_send(&rt_link_scb->sendevent, (0x01 << frame->head.service));
     }
-    rt_link_frame_send(&command_frame.slist);
-    return RT_EOK;
+    else
+    {
+        rt_link_scb->service[frame->head.service]->send_cb(rt_link_scb->service[frame->head.service],
+                                            (frame->real_data - (frame->index * RT_LINK_MAX_DATA_LENGTH)));
+        rt_link_frame_remove(rt_link_scb->service[frame->head.service]);
+    }
 }
 
 static rt_err_t rt_link_resend_handle(struct rt_link_frame *receive_frame)
@@ -296,11 +373,12 @@ static rt_err_t rt_link_resend_handle(struct rt_link_frame *receive_frame)
 static rt_err_t rt_link_confirm_handle(struct rt_link_frame *receive_frame)
 {
     static struct rt_link_frame *send_frame = RT_NULL;
-    struct rt_link_frame *find_frame = RT_NULL;
     rt_slist_t *tem_list = RT_NULL;
     rt_uint16_t seq_offset = 0;
-
     LOG_D("confirm seq(%d) frame", receive_frame->head.sequence);
+
+    rt_timer_stop(&rt_link_scb->sendtimer);
+
     if (rt_link_scb->link_status == RT_LINK_NO_RESPONSE)
     {
         /* The handshake success and resends the data frame */
@@ -319,44 +397,42 @@ static rt_err_t rt_link_confirm_handle(struct rt_link_frame *receive_frame)
     {
         return -RT_ERROR;
     }
-
     send_frame = rt_container_of(tem_list, struct rt_link_frame, slist);
-    seq_offset = rt_link_check_seq(receive_frame->head.sequence,
-                                   rt_link_scb->tx_seq);
+    seq_offset = rt_link_check_seq(receive_frame->head.sequence, rt_link_scb->tx_seq);
     if (seq_offset <= send_frame->total)
     {
         LOG_D("confirm frame (%d)", receive_frame->head.sequence);
-        for (int i = 0; i < seq_offset; i++)
-        {
-            find_frame = rt_container_of(tem_list, struct rt_link_frame, slist);
-            LOG_D("confirm(%d), remove(%d)", receive_frame->head.sequence, find_frame->head.sequence);
-
-            rt_enter_critical();
-            rt_slist_remove(&rt_link_scb->tx_data_slist, &find_frame->slist);
-            rt_exit_critical();
-            find_frame->real_data = RT_NULL;
-            rt_link_frame_free(find_frame);
-
-            tem_list = rt_slist_first(&rt_link_scb->tx_data_slist);
-            if (tem_list == RT_NULL)
-            {
-                break;
-            }
-        }
+        rt_link_service_send_finish(RT_LINK_EOK);
         rt_link_scb->tx_seq = receive_frame->head.sequence;
         rt_link_scb->link_status = RT_LINK_CONNECT_DONE;
-        if (tem_list == RT_NULL)
-        {
-            LOG_D("SEND_OK");
-            rt_event_send(&rt_link_scb->event, RT_LINK_SEND_OK_EVENT);
-        }
-        else
+
+        tem_list = rt_slist_first(&rt_link_scb->tx_data_slist);
+        if (tem_list != RT_NULL)
         {
             LOG_D("Continue sending");
             rt_event_send(&rt_link_scb->event, RT_LINK_SEND_READY_EVENT);
         }
     }
     return RT_EOK;
+}
+
+/* serv type rt_link_service_e */
+static void rt_link_recv_finish(rt_uint8_t serve, void *data, rt_size_t size)
+{
+    if(rt_link_scb->service[serve] == RT_NULL)
+    {
+        return;
+    }
+
+    if (rt_link_scb->service[serve]->recv_cb == RT_NULL)
+    {
+        rt_free(data);
+        LOG_E("service %d haven't been registered.", serve);
+    }
+    else
+    {
+        rt_link_scb->service[serve]->recv_cb(rt_link_scb->service[serve], data, size);
+    }
 }
 
 static rt_err_t rt_link_short_handle(struct rt_link_frame *receive_frame)
@@ -368,18 +444,11 @@ static rt_err_t rt_link_short_handle(struct rt_link_frame *receive_frame)
         rt_link_command_frame_send(receive_frame->head.sequence, RT_LINK_CONFIRM_FRAME, RT_NULL);
         rt_link_scb->rx_record.rx_seq = receive_frame->head.sequence;
 
-        if (rt_link_scb->channel[receive_frame->head.channel].upload_callback == RT_NULL)
-        {
-            rt_free(rt_link_scb->rx_record.dataspace);
-            LOG_E("Channel %d has not been registered", receive_frame->head.channel);
-        }
-        else
-        {
-            rt_enter_critical();
-            rt_link_hw_copy(rt_link_scb->rx_record.dataspace, receive_frame->real_data, receive_frame->data_len);
-            rt_exit_critical();
-            rt_link_scb->channel[receive_frame->head.channel].upload_callback(rt_link_scb->rx_record.dataspace, receive_frame->data_len);
-        }
+        rt_enter_critical();
+        rt_link_hw_copy(rt_link_scb->rx_record.dataspace, receive_frame->real_data, receive_frame->data_len);
+        rt_exit_critical();
+
+        rt_link_recv_finish(receive_frame->head.service, rt_link_scb->rx_record.dataspace, receive_frame->data_len);
         rt_link_scb->rx_record.dataspace = RT_NULL;
         rt_link_frame_stop_receive(receive_frame);
     }
@@ -414,10 +483,6 @@ static void _long_handle_first(struct rt_link_frame *receive_frame, rt_uint8_t *
 static void _long_handle_second(struct rt_link_frame *receive_frame, rt_uint8_t count_mask)
 {
     static rt_uint8_t ack_mask = RT_LINK_ACK_MAX;
-
-    void *data = RT_NULL;
-    rt_size_t size = 0;
-    rt_uint16_t serve = 0;
     rt_size_t offset = 0; /* offset, count from 0 */
 
     receive_frame->index = rt_link_check_seq(receive_frame->head.sequence, rt_link_scb->rx_record.rx_seq) - 1;
@@ -452,10 +517,9 @@ static void _long_handle_second(struct rt_link_frame *receive_frame, rt_uint8_t 
         {
             rt_timer_stop(&rt_link_scb->longframetimer);
 
+            rt_link_recv_finish(receive_frame->head.service, rt_link_scb->rx_record.dataspace, receive_frame->extend.parameter);
+
             rt_enter_critical();
-            data = rt_link_scb->rx_record.dataspace;
-            size = receive_frame->extend.parameter;
-            serve = receive_frame->head.channel;
             /* empty  rx_record */
             rt_link_scb->rx_record.rx_seq += rt_link_scb->rx_record.total;
             rt_link_scb->rx_record.dataspace = RT_NULL;
@@ -464,16 +528,6 @@ static void _long_handle_second(struct rt_link_frame *receive_frame, rt_uint8_t 
             ack_mask = RT_LINK_ACK_MAX;
             rt_link_frame_stop_receive(receive_frame);
             rt_exit_critical();
-
-            if (rt_link_scb->channel[serve].upload_callback == RT_NULL)
-            {
-                rt_free(data);
-                LOG_E("channel %d haven't been registered.", serve);
-            }
-            else
-            {
-                rt_link_scb->channel[serve].upload_callback(data, size);
-            }
         }
         else if (rt_link_hw_recv_len(rt_link_scb->rx_buffer) < (receive_frame->data_len % RT_LINK_MAX_DATA_LENGTH))
         {
@@ -546,24 +600,6 @@ static rt_err_t rt_link_parse_frame(struct rt_link_frame *receive_frame)
     return RT_EOK;
 }
 
-/* Empty the sending list */
-static void rt_link_datalist_empty(void)
-{
-    struct rt_link_frame *find_frame = RT_NULL;
-    rt_slist_t *tem_list = rt_slist_first(&rt_link_scb->tx_data_slist);
-    while (tem_list != RT_NULL)
-    {
-        find_frame = rt_container_of(tem_list, struct rt_link_frame, slist);
-        tem_list = rt_slist_next(tem_list);
-        rt_enter_critical();
-        rt_slist_remove(&rt_link_scb->tx_data_slist, &find_frame->slist);
-        rt_exit_critical();
-
-        find_frame->real_data = RT_NULL;
-        rt_link_frame_free(find_frame);
-    }
-}
-
 /* RT_LINK_READ_CHECK_EVENT handle */
 static void rt_link_frame_check(void)
 {
@@ -585,6 +621,7 @@ static void rt_link_frame_check(void)
         {
         case FIND_FRAME_HEAD:
         {
+            LOG_D("recv len %d 0x%x",recv_len ,*rt_link_scb->rx_buffer->read_point);
             /* if we can't find frame head, throw that data */
             if ((*rt_link_scb->rx_buffer->read_point & RT_LINK_FRAME_HEAD_MASK) == RT_LINK_FRAME_HEAD)
             {
@@ -607,8 +644,15 @@ static void rt_link_frame_check(void)
             rt_link_frame_init(&receive_frame, RT_NULL);
             rt_link_hw_copy((rt_uint8_t *)&receive_frame.head, data, sizeof(struct rt_link_frame_head));
             rt_link_hw_buffer_point_shift(&data, sizeof(struct rt_link_frame_head));
+
             receive_frame.data_len = receive_frame.head.length;
-            LOG_D("check seq(%d) data len(%d).", receive_frame.head.sequence, receive_frame.data_len);
+            LOG_D("check seq(%d) data len(%d). attr(%d) param(0x%x)", receive_frame.head.sequence, receive_frame.data_len, receive_frame.extend.attribute,receive_frame.extend.parameter);
+            if(receive_frame.head.service >= RT_LINK_SERVICE_MAX)
+            {
+                analysis_status = FIND_FRAME_HEAD;
+                receive_frame.attribute = RT_LINK_RESERVE_FRAME;
+                break;
+            }
 
             if (receive_frame.head.extend)
             {
@@ -757,6 +801,7 @@ static void rt_link_frame_check(void)
 
         case HEADLE_FRAME_DATA:
         {
+            LOG_D("read_point 0x%p",rt_link_scb->rx_buffer->read_point);
             rt_link_hw_buffer_point_shift(&rt_link_scb->rx_buffer->read_point, buff_len);
             rt_link_parse_frame(&receive_frame);
             data = RT_NULL;
@@ -775,6 +820,9 @@ static void rt_link_frame_check(void)
 
 static void rt_link_send_ready(void)
 {
+    rt_int32_t timeout = RT_LINK_SENT_FRAME_TIMEOUT;
+    rt_timer_control(&rt_link_scb->sendtimer, RT_TIMER_CTRL_SET_TIME, &timeout);
+    rt_timer_start(&rt_link_scb->sendtimer);
     if (rt_link_scb->link_status != RT_LINK_CONNECT_DONE)
     {
         rt_link_scb->link_status = RT_LINK_NO_RESPONSE;
@@ -784,7 +832,9 @@ static void rt_link_send_ready(void)
     {
         if (RT_EOK != rt_link_frame_send(&rt_link_scb->tx_data_slist))
         {
-            rt_event_send(&rt_link_scb->event, RT_LINK_SEND_FAILED_EVENT);
+            struct rt_link_frame *frame = rt_container_of(rt_slist_next(&rt_link_scb->tx_data_slist), struct rt_link_frame, slist);
+            rt_link_scb->service[frame->head.service]->err = RT_LINK_EIO;
+            rt_event_send(&rt_link_scb->sendevent, (0x01 << frame->head.service));
         }
     }
 }
@@ -797,32 +847,33 @@ static void rt_link_frame_recv_timeout(void)
 
 static void rt_link_send_timeout(void)
 {
-    static rt_uint8_t count = 0;
-    if (count++ > 5)
+    LOG_I("send count(%d)",(rt_uint32_t)rt_link_scb->sendtimer.parameter);
+    if ((rt_uint32_t)rt_link_scb->sendtimer.parameter >= 5)
     {
+        rt_timer_stop(&rt_link_scb->sendtimer);
         LOG_W("Send timeout, please check the link status!");
-        count = 0;
-        rt_event_send(&rt_link_scb->event, RT_LINK_SEND_FAILED_EVENT);
+        rt_link_scb->sendtimer.parameter = 0x00;
+        rt_link_service_send_finish(RT_LINK_ETIMEOUT);
     }
     else
     {
-        rt_timer_start(&rt_link_scb->sendtimer);
         rt_link_command_frame_send(rt_link_scb->tx_seq, RT_LINK_HANDSHAKE_FRAME, rt_link_scb->rx_record.rx_seq);
     }
 }
 
-static int rt_link_long_recv_timeout(void)
+static void rt_link_long_recv_timeout(void)
 {
-    static rt_uint8_t count = 0;
-    if (count++ > 5)
+    if ((rt_uint32_t)rt_link_scb->longframetimer.parameter >= 5)
     {
         LOG_W("long package receive timeout");
-        count = 0;
+        rt_link_scb->longframetimer.parameter = 0x00;
         _stop_recv_long();
+        rt_timer_stop(&rt_link_scb->longframetimer);
     }
     else
     {
-        for (rt_uint8_t total = rt_link_scb->rx_record.total; total > 0; total--)
+        rt_uint8_t total = rt_link_scb->rx_record.total;
+        for (; total > 0; total--)
         {
             if (((rt_link_scb->rx_record.long_count >> (total - 1)) & 0x01) == 0x00)
             {
@@ -831,7 +882,6 @@ static int rt_link_long_recv_timeout(void)
             }
         }
     }
-    return RT_EOK;
 }
 
 void rt_link_thread(void *parameter)
@@ -839,14 +889,16 @@ void rt_link_thread(void *parameter)
     rt_uint32_t recved = 0;
     while (1)
     {
-        rt_event_recv(&rt_link_scb->event, RT_LINK_READ_CHECK_EVENT |
-                      RT_LINK_SEND_READY_EVENT  |
-                      RT_LINK_SEND_TIMEOUT_EVENT |
-                      RT_LINK_RECV_TIMEOUT_FRAME_EVENT |
-                      RT_LINK_RECV_TIMEOUT_LONG_EVENT,
-                      RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
-                      RT_WAITING_FOREVER,
-                      &recved);
+        rt_event_recv(&rt_link_scb->event, 
+                    RT_LINK_READ_CHECK_EVENT |
+                    RT_LINK_SEND_READY_EVENT  |
+                    RT_LINK_SEND_TIMEOUT_EVENT |
+                    RT_LINK_RECV_TIMEOUT_FRAME_EVENT |
+                    RT_LINK_RECV_TIMEOUT_LONG_EVENT,
+                    RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                    RT_WAITING_FOREVER,
+                    &recved);
+        LOG_D("event recv (0x%x)",recved);
 
         if (recved & RT_LINK_READ_CHECK_EVENT)
         {
@@ -877,16 +929,24 @@ void rt_link_thread(void *parameter)
 
 static void rt_link_sendtimer_callback(void *parameter)
 {
+    LOG_I("sendtimer");
+    rt_uint32_t count = (rt_uint32_t)rt_link_scb->sendtimer.parameter + 1;
+    rt_link_scb->sendtimer.parameter = (void*)count;
+    
     rt_event_send(&rt_link_scb->event, RT_LINK_SEND_TIMEOUT_EVENT);
 }
 
 static void rt_link_recvtimer_callback(void *parameter)
 {
+    LOG_I("recvtimer");
     rt_event_send(&rt_link_scb->event, RT_LINK_RECV_TIMEOUT_FRAME_EVENT);
 }
 
 static void rt_link_receive_long_frame_callback(void *parameter)
 {
+    LOG_I("long_frame");
+    rt_uint32_t count = (rt_uint32_t)rt_link_scb->longframetimer.parameter + 1;
+    rt_link_scb->longframetimer.parameter = (void*)count;
     rt_event_send(&rt_link_scb->event, RT_LINK_RECV_TIMEOUT_LONG_EVENT);
 }
 
@@ -897,24 +957,26 @@ static void rt_link_receive_long_frame_callback(void *parameter)
  * @param size      send data size
  * @return The actual size of the data sent
  * */
-rt_size_t rt_link_send(rt_link_service_t service, void *data, rt_size_t size)
+rt_size_t rt_link_send(struct rt_link_service *service, const void *data, rt_size_t size)
 {
-    if ((size == 0) || (data == RT_NULL) || (service >= RT_LINK_SERVICE_MAX))
-    {
-        return 0;
-    }
-    rt_mutex_take(&rt_link_scb->tx_lock, RT_WAITING_FOREVER);
+    RT_ASSERT(service != RT_NULL);
 
     rt_uint32_t recved = 0;
-    rt_err_t result = RT_EOK;
-    rt_uint32_t timeout = 0;
-
     rt_uint8_t total = 0; /* The total number of frames to send */
     rt_uint8_t index = 0; /* The index of the split packet */
     rt_size_t offset = 0; /* The offset of the send data */
+    rt_size_t send_len = 0;
 
     struct rt_link_frame *send_frame = RT_NULL;
-    rt_link_frame_attribute_t attribute;
+    rt_link_frame_attr_e attribute = RT_LINK_SHORT_DATA_FRAME;
+
+    if ((size == 0) || (data == RT_NULL))
+    {
+        service->err = RT_LINK_ERR;
+        goto __exit;
+    }
+
+    service->err = RT_LINK_EOK;
     if (size % RT_LINK_MAX_DATA_LENGTH == 0)
     {
         total = size / RT_LINK_MAX_DATA_LENGTH;
@@ -926,24 +988,25 @@ rt_size_t rt_link_send(rt_link_service_t service, void *data, rt_size_t size)
 
     if (total > RT_LINK_FRAMES_MAX)
     {
-        result = -RT_ENOMEM;
+        service->err = RT_LINK_ENOMEM;
         goto __exit;
     }
     else if (total > 1)
     {
         attribute =  RT_LINK_LONG_DATA_FRAME;
     }
-    else
-    {
-        attribute = RT_LINK_SHORT_DATA_FRAME;
-    }
 
     do
     {
         send_frame = rt_malloc(sizeof(struct rt_link_frame));
+        if(send_frame == RT_NULL)
+        {
+            service->err = RT_LINK_ENOMEM;
+            goto __exit;
+        }
         rt_link_frame_init(send_frame, FRAME_CRC | FRAME_ACK);
         send_frame->head.sequence = rt_link_scb->tx_seq + 1 + index;
-        send_frame->head.channel = service;
+        send_frame->head.service = service->service;
         send_frame->real_data = (rt_uint8_t *)data + offset;
         send_frame->index = index;
         send_frame->total = total;
@@ -974,41 +1037,28 @@ rt_size_t rt_link_send(rt_link_service_t service, void *data, rt_size_t size)
         rt_slist_append(&rt_link_scb->tx_data_slist, &send_frame->slist);
 
         index++;
+        send_len += send_frame->data_len;
     }while(total > index);
 
-    timeout = RT_LINK_SENT_FRAME_TIMEOUT * total;
-    rt_timer_control(&rt_link_scb->sendtimer, RT_TIMER_CTRL_SET_TIME, &timeout);
-    rt_timer_start(&rt_link_scb->sendtimer);
     /* Notify the core thread to send packet */
     rt_event_send(&rt_link_scb->event, RT_LINK_SEND_READY_EVENT);
 
-    /* Wait for the packet to be sent successfully */
-    rt_event_recv(&rt_link_scb->event, RT_LINK_SEND_OK_EVENT | RT_LINK_SEND_FAILED_EVENT, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &recved);
+    if(service->timeout_tx != RT_WAITING_NO)
+    {
+        /* Wait for the packet to send the result */
+        rt_err_t ret = rt_event_recv(&rt_link_scb->sendevent, (0x01 << service->service), 
+                                            RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, 
+                                            service->timeout_tx, &recved);
+        if(ret == -RT_ETIMEOUT)
+        {
+            service->err = RT_LINK_ETIMEOUT;
+            send_len = 0;
+        }
+        rt_link_frame_remove(service);
+    }
 
-    if (recved & RT_LINK_SEND_OK_EVENT)
-    {
-        result = RT_EOK;
-    }
-    else if (recved & RT_LINK_SEND_FAILED_EVENT)
-    {
-        LOG_E("the data (%dB) send failed", size);
-        result = -RT_ERROR;
-    }
-    else
-    {
-        LOG_E("unexpected event.");
-        result = -RT_ERROR;
-    }
 __exit:
-    rt_timer_stop(&rt_link_scb->sendtimer);
-    /* Empty the sending list */
-    rt_link_datalist_empty();
-    rt_mutex_release(&rt_link_scb->tx_lock);
-    if (result == RT_EOK)
-    {
-        return size;
-    }
-    return result;
+    return send_len;
 }
 
 void rtlink_status(void)
@@ -1034,7 +1084,7 @@ void rtlink_status(void)
             rt_slist_t *data = RT_NULL;
             rt_slist_for_each(data, &rt_link_scb->tx_data_slist)
             {
-                rt_kprintf("\tsend data list: serv %u\t", ((struct rt_link_frame_head *)data)->channel);
+                rt_kprintf("\tsend data list: serv %u\t", ((struct rt_link_frame_head *)data)->service);
                 rt_kprintf(" seq %u\t", ((struct rt_link_frame_head *)data)->sequence);
                 rt_kprintf(" len %u\n", ((struct rt_link_frame_head *)data)->length);
             }
@@ -1044,10 +1094,10 @@ void rtlink_status(void)
             rt_kprintf("\tsend data list: NULL\n");
         }
 
-        rt_uint8_t serv = sizeof(rt_link_scb->channel) / sizeof(struct rt_link_service);
+        rt_uint8_t serv = RT_LINK_SERVICE_MAX - 1;
         while (serv--)
         {
-            rt_kprintf("\tservices [%d](0x%p)\n", serv, rt_link_scb->channel[serv]);
+            rt_kprintf("\tservices [%d](0x%p)\n", serv, rt_link_scb->service[serv]);
         }
     }
     else
@@ -1069,7 +1119,6 @@ rt_err_t rt_link_deinit(void)
         rt_timer_detach(&rt_link_scb->longframetimer);
         rt_timer_detach(&rt_link_scb->sendtimer);
         rt_timer_detach(&rt_link_scb->recvtimer);
-        rt_mutex_detach(&rt_link_scb->tx_lock);
         rt_event_detach(&rt_link_scb->event);
         rt_free(rt_link_scb);
         rt_link_scb = RT_NULL;
@@ -1106,16 +1155,18 @@ int rt_link_init(void)
     }
 
     rt_memset(rt_link_scb, 0, sizeof(struct rt_link_session));
-    rt_event_init(&rt_link_scb->event, "lny_event", RT_IPC_FLAG_FIFO);
+    rt_event_init(&rt_link_scb->event, "rtlink", RT_IPC_FLAG_FIFO);
     rt_event_control(&rt_link_scb->event, RT_IPC_CMD_RESET, RT_NULL);
 
-    rt_mutex_init(&rt_link_scb->tx_lock, "tx_lock", RT_IPC_FLAG_FIFO);
+    rt_event_init(&rt_link_scb->sendevent, "send_rtlink", RT_IPC_FLAG_FIFO);
+    rt_event_control(&rt_link_scb->sendevent, RT_IPC_CMD_RESET, RT_NULL);
+
     rt_timer_init(&rt_link_scb->sendtimer, "tx_time", rt_link_sendtimer_callback,
-                  RT_NULL, 0, RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_PERIODIC);
+                RT_NULL, 0, RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_PERIODIC);
     rt_timer_init(&rt_link_scb->recvtimer, "rx_time", rt_link_recvtimer_callback,
-                  RT_NULL, 0, RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_ONE_SHOT);
+                RT_NULL, 0, RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_ONE_SHOT);
     rt_timer_init(&rt_link_scb->longframetimer, "rxl_time", rt_link_receive_long_frame_callback,
-                  RT_NULL, 0, RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_PERIODIC);
+                RT_NULL, 0, RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_PERIODIC);
 
     rt_link_scb->link_status = RT_LINK_ESTABLISHING;
 
@@ -1137,7 +1188,7 @@ int rt_link_init(void)
         goto __exit;
     }
     rt_thread_startup(thread);
-    result = rt_link_hw_init();
+
 
 __exit:
     if (result != RT_EOK)
@@ -1162,31 +1213,32 @@ MSH_CMD_EXPORT(rt_link_init, rt link init);
  * @param function  receive callback function
  * @return Function Execution Result
  * */
-rt_err_t rt_link_service_attach(rt_link_service_t service, rt_err_t (*function)(void *data, rt_size_t size))
+rt_err_t rt_link_service_attach(struct rt_link_service *serv)
 {
-    if (service >= RT_LINK_SERVICE_MAX)
+    if (serv->service >= RT_LINK_SERVICE_MAX)
     {
         LOG_W("Invalid parameter.");
-        return -RT_ERROR;
+        return -RT_EINVAL;
     }
-    rt_link_scb->channel[service].upload_callback = function;
-    LOG_I("rt link attach service[%02d].", service);
+    rt_link_hw_init();
+    rt_link_scb->service[serv->service] = serv;
+    LOG_I("rt link attach service[%02d].", serv->service);
     return RT_EOK;
 }
 
 /**
  * rtlink service detach
- * @param service   Registered service channel, choose enum rt_link_service_t
+ * @param service   Registered service channel, struct rt_link_service
  * @return rt_err_t Function Execution Result
  * */
-rt_err_t rt_link_service_detach(rt_link_service_t service)
+rt_err_t rt_link_service_detach(struct rt_link_service *serv)
 {
-    if (service >= RT_LINK_SERVICE_MAX)
+    if (serv->service >= RT_LINK_SERVICE_MAX)
     {
         LOG_W("Invalid parameter.");
-        return -RT_ERROR;
+        return -RT_EINVAL;
     }
-    rt_link_scb->channel[service].upload_callback = RT_NULL;
-    LOG_I("rt link detach service[%02d].", service);
+    rt_link_scb->service[serv->service] = RT_NULL;
+    LOG_I("rt link detach service[%02d].", serv->service);
     return RT_EOK;
 }

@@ -17,6 +17,8 @@
     #define RT_LINK_HW_DEVICE_NAME "uart2"
 #endif
 
+#define RT_LINK_HW_RB_BUFSZ 64//BSP_UART2_RX_BUFSIZE
+
 #define DBG_TAG              "rtlink_port"
 #define DBG_LVL              DBG_INFO
 #include <rtdbg.h>
@@ -25,10 +27,8 @@ static struct rt_device *hw_device = RT_NULL;
 rt_err_t rt_link_port_rx_ind(rt_device_t device, rt_size_t size)
 {
     RT_ASSERT(device != RT_NULL);
-
-    rt_uint8_t buffer[RT_SERIAL_RB_BUFSZ] = {0};
-    rt_size_t length = 0;
-    length = rt_device_read(device, 0, buffer, sizeof(buffer));
+    rt_uint8_t buffer[RT_LINK_HW_RB_BUFSZ] = {0};
+    rt_size_t length = rt_device_read(device, 0, buffer, sizeof(buffer));
     rt_link_hw_write_cb(&buffer, length);
     return RT_EOK;
 }
@@ -40,11 +40,15 @@ rt_size_t rt_link_port_send(void *data, rt_size_t length)
     return size;
 }
 
-int rt_link_port_init(void)
+rt_err_t rt_link_port_init(void)
 {
     hw_device = rt_device_find(RT_LINK_HW_DEVICE_NAME);
     if (hw_device)
     {
+//        struct serial_configure config = RT_SERIAL_CONFIG_DEFAULT;  /* 初始化配置参数 */
+//        config.baud_rate = BAUD_RATE_9600;        //修改波特率为 9600
+//        rt_device_control(hw_device, RT_DEVICE_CTRL_CONFIG, &config);
+
         rt_device_open(hw_device, RT_DEVICE_OFLAG_RDWR | RT_DEVICE_FLAG_INT_RX);
         rt_device_set_rx_indicate(hw_device, rt_link_port_rx_ind);
     }
@@ -56,7 +60,7 @@ int rt_link_port_init(void)
     return RT_EOK;
 }
 
-int rt_link_port_deinit(void)
+rt_err_t rt_link_port_deinit(void)
 {
     hw_device = rt_device_find(RT_LINK_HW_DEVICE_NAME);
     if (hw_device)

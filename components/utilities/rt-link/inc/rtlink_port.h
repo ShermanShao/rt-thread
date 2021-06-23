@@ -14,8 +14,8 @@
 #include <rtdef.h>
 
 /* Functions that need to be implemented at the hardware */
-int rt_link_port_init(void);
-int rt_link_port_deinit(void);
+rt_err_t rt_link_port_init(void);
+rt_err_t rt_link_port_deinit(void);
 rt_size_t rt_link_port_send(void *data, rt_size_t length);
 
 #ifdef RT_LINK_USING_HW_CRC
