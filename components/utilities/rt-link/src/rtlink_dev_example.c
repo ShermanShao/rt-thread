@@ -77,10 +77,6 @@ static void rtlink_fread(int argc, char *argv[])
 {
     int read_len;
     read_len = read(fd, test_buff, sizeof(test_buff));
-    if (read_len <= 0)
-    {
-        LOG_E("read error!");
-    }
     LOG_D("read len %d", read_len);
     LOG_HEX("read", 8, test_buff, 32);
 }
@@ -146,16 +142,14 @@ static void listen_thread(void *param)
     {
         rt_uint8_t *write_buf = RT_NULL;
         int write_len = 0;
-        fd_set readfds, writefds, exceptfds;
+        fd_set readfds, writefds;
         FD_ZERO(&readfds);
         FD_ZERO(&writefds);
-        FD_ZERO(&exceptfds);
         FD_SET(fd, &readfds);
         FD_SET(fd, &writefds);
-        FD_SET(fd, &exceptfds);
 
-        int ret = select(fd + 1, &readfds, &writefds, &exceptfds, RT_NULL);
-        LOG_D("select ret(%d), read (%d), write (%d), except (%d)", ret, readfds, writefds, exceptfds);
+        int ret = select(fd + 1, &readfds, &writefds, RT_NULL, RT_NULL);
+        LOG_D("select ret(%d), read (%d), write (%d)", ret, readfds, writefds);
         if (FD_ISSET(fd, &readfds))
         {
             LOG_I("POLLIN");
@@ -175,11 +169,6 @@ static void listen_thread(void *param)
             }
         }
 
-        if (FD_ISSET(fd, &exceptfds))
-        {
-            LOG_I("POLLERR");
-        }
-
         rt_thread_delay(500);
     }
     LOG_I("fd (%s) listen thread exit", RTLINK02);
@@ -195,7 +184,7 @@ static void rtlink_fselect()
                          RT_NULL);
 
     /* step2: Initialize the rlink device as the default configuration,  */
-    rt_device_t device = rt_device_find(RTLINK01);
+    rt_device_t device = rt_device_find(RTLINK02);
     if (device == RT_NULL)
     {
         LOG_E("device not find!");

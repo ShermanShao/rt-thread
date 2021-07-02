@@ -134,15 +134,7 @@ int rtlink_fops_poll (struct dfs_fd *fd, struct rt_pollreq *req)
             mask |= POLLIN;
         rt_hw_interrupt_enable(level);
     }
-
-    if(RT_LINK_EOK == RTLINK_SERV(device).err)
-    {
-        mask |= POLLOUT;
-    }
-    else
-    {
-        mask |= POLLERR;
-    }
+    mask |= POLLOUT;
 
     return mask;
 }
@@ -292,23 +284,25 @@ rt_size_t rt_link_dev_read(rt_device_t dev, rt_off_t pos, void *buffer, rt_size_
         rt_link_event_recv(&rtlink->service);
     }
 
-    node = rt_container_of(rt_slist_next(&rtlink->recv_head), struct rtlink_recv_list, list);
-    unread_len = (node->size) - (node->index);
-    read_len = (size > unread_len) ? unread_len : size;
-    rt_memcpy(buffer, (rt_uint8_t*)node->data+node->index, read_len);
-    node->index += read_len;
-
-    if(node->index >= node->size)
-    {
-        rt_slist_remove(&rtlink->recv_head, &node->list);
-        node->index = 0;
-        rt_free(node->data);
-        rt_free(node);
-    }
-
     if(rt_slist_first(&rtlink->recv_head) != RT_NULL)
     {
-        rt_link_event_send(&rtlink->service);
+        node = rt_container_of(rt_slist_next(&rtlink->recv_head), struct rtlink_recv_list, list);
+        unread_len = (node->size) - (node->index);
+        read_len = (size > unread_len) ? unread_len : size;
+        rt_memcpy(buffer, (rt_uint8_t*)node->data+node->index, read_len);
+        node->index += read_len;
+
+        if(node->index >= node->size)
+        {
+            rt_slist_remove(&rtlink->recv_head, &node->list);
+            node->index = 0;
+            rt_free(node->data);
+            rt_free(node);
+        }
+        if(rt_slist_first(&rtlink->recv_head) != RT_NULL)
+        {
+            rt_link_event_send(&rtlink->service);
+        }
     }
     return read_len;
 }
