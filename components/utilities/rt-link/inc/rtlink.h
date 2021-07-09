@@ -14,6 +14,9 @@
 
 #include <rtdef.h>
 
+#define RT_LINK_NONACK
+#define RT_LINK_NONCRC
+
 #define RT_LINK_AUTO_INIT
 
 #define RT_LINK_FRAME_HEAD              0x15
@@ -24,9 +27,20 @@
 #define RT_LINK_ACK_MAX     0x07
 #define RT_LINK_CRC_LENGTH      4
 #define RT_LINK_HEAD_LENGTH     4
-#define RT_LINK_MAX_EXTEND_LENGTH       4
-#define RT_LINK_MAX_DATA_LENGTH     (RT_LINK_MAX_FRAME_LENGTH - RT_LINK_HEAD_LENGTH - RT_LINK_MAX_EXTEND_LENGTH - RT_LINK_CRC_LENGTH)
-#define RT_LINK_RECEIVE_BUFFER_LENGTH       (RT_LINK_MAX_FRAME_LENGTH * RT_LINK_FRAMES_MAX + RT_LINK_HEAD_LENGTH + RT_LINK_MAX_EXTEND_LENGTH)
+#define RT_LINK_EXTEND_LENGTH       4
+
+#ifdef RT_LINK_NONCRC
+#define RT_LINK_MAX_DATA_LENGTH     (RT_LINK_MAX_FRAME_LENGTH - \
+                                                        /* RT_LINK_EXTEND_LENGTH -\ */
+                                                        RT_LINK_HEAD_LENGTH)
+#else
+#define RT_LINK_MAX_DATA_LENGTH     (RT_LINK_MAX_FRAME_LENGTH - \
+                                                        /* RT_LINK_EXTEND_LENGTH -\ */
+                                                        RT_LINK_HEAD_LENGTH - \
+                                                        RT_LINK_CRC_LENGTH)
+#endif
+
+#define RT_LINK_RECEIVE_BUFFER_LENGTH       (RT_LINK_MAX_FRAME_LENGTH * RT_LINK_FRAMES_MAX + RT_LINK_HEAD_LENGTH + RT_LINK_EXTEND_LENGTH)
 
 typedef enum
 {
@@ -37,6 +51,13 @@ typedef enum
     RT_LINK_SERVICE_MSHTOOLS = 4,
     RT_LINK_SERVICE_MAX /* Expandable to a maximum of 31 */
 } rt_link_service_e;
+
+typedef enum
+{
+    RT_LINK_SERVICE_INIT = 0,
+    RT_LINK_SERVICE_CONN = 1,
+    RT_LINK_SERVICE_DISCONN = 2,
+} rt_link_service_status_e;
 
 enum
 {
@@ -129,7 +150,7 @@ struct rt_link_record
     rt_uint8_t *dataspace;  /* the space of long frame */
 };
 
-struct rt_link_extend
+struct rt_link_frame_extend
 {
     rt_uint16_t attribute;           /* rt_link_frame_attr_e */
     rt_uint16_t parameter;
@@ -138,7 +159,7 @@ struct rt_link_extend
 struct rt_link_frame
 {
     struct rt_link_frame_head head;         /* frame head */
-    struct rt_link_extend extend;           /* frame extend data */
+    struct rt_link_frame_extend extend;           /* frame extend data */
     rt_uint8_t *real_data;                  /* the origin data */
     rt_uint32_t crc;                        /* CRC result */
 
@@ -151,16 +172,34 @@ struct rt_link_frame
     rt_slist_t slist;            /* the frame will hang on the send list on session */
 };
 
+struct rtlink_recv_list
+{
+    void *data;
+    rt_size_t size;
+    rt_size_t index;
+    struct rt_slist_node list;
+};
+
+#define RT_LINK_SERVICE_DEFAULT_CONFIG  {}
+
 struct rt_link_service
 {
+    struct rt_ringbuffer send_rb;
+    struct rt_mutex send_mutex;
+
+    struct rt_ringbuffer recv_rb;
+    struct rt_mutex recv_mutex;
+    rt_uint8_t rb_flag; /* ring buffer write/read rule */
+
     void (*send_cb)(struct rt_link_service* service, void* buffer);
-    void (*recv_cb)(struct rt_link_service* service, void *data, rt_size_t size);
+    void (*recv_cb)(struct rt_link_service* service, rt_size_t size);
 
     rt_int32_t timeout_tx;
-    void* user_data;
+    void *user_data;
 
-    rt_link_err_e err;
+    rt_link_service_status_e state;
     rt_link_service_e service;
+    rt_link_err_e err;
 };
 
 struct rt_link_session
@@ -168,10 +207,11 @@ struct rt_link_session
     struct rt_event event;      /* Drives the core thread to runing */
     struct rt_link_service *service[RT_LINK_SERVICE_MAX]; /* The service transport channel */
 
-    rt_slist_t tx_data_slist;
+    // rt_slist_t tx_data_slist;
     rt_uint8_t tx_seq;     /* The data frame sequence number, which represents the confirmed data frame number */
     struct rt_event sendevent;  /*  */
     struct rt_timer sendtimer;  /* send timer for rt-link */
+    rt_uint8_t tx_buffer[RT_LINK_MAX_FRAME_LENGTH];
 
     struct rt_link_record rx_record;    /* the memory of receive status */
     struct rt_timer recvtimer;          /* receive a frame timer for rt link */
@@ -189,6 +229,7 @@ int rt_link_init(void);
 rt_err_t rt_link_deinit(void);
 
 rt_size_t rt_link_send(struct rt_link_service *service, const void *data, rt_size_t size);
+rt_size_t rt_link_read(struct rt_link_service *service, rt_size_t size);
 
 /* rtlink service attach and detach */
 rt_err_t rt_link_service_attach(struct rt_link_service *service);

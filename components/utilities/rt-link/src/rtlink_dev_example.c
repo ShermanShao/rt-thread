@@ -355,6 +355,9 @@ static void rtlink_dwrite(int argc, char *argv[])
 }
 MSH_CMD_EXPORT(rtlink_dwrite, rtlink device interface example);
 
+rt_uint8_t rx_buffer[1024];
+rt_uint8_t tx_buffer[1024];
+
 static void rtlink_dinit(void)
 {
     /* step1: register rtlink to to the device framework */
@@ -374,12 +377,12 @@ static void rtlink_dinit(void)
     rt_device_init(device);
 
     /* step3: config rtlink device rx/tx callback, channel, send timeout */
+    rtlink_dev.service.service = RT_LINK_SERVICE_SOCKET;
+    rtlink_dev.service.timeout_tx = RT_WAITING_NO;
+    rt_ringbuffer_init(&rtlink_dev.service.recv_rb, rx_buffer, sizeof(rx_buffer));
+    rt_ringbuffer_init(&rtlink_dev.service.send_rb, tx_buffer, sizeof(tx_buffer));
     rt_device_set_rx_indicate(device, rtlink_dev_rx_ind);
     rt_device_set_tx_complete(device, rtlink_dev_tx_done);
-    struct rt_link_service service;
-    service.service = RT_LINK_SERVICE_SOCKET;
-    service.timeout_tx = RT_WAITING_NO; //rt_tick_from_millisecond(1000);
-    rt_device_control(device, RT_DEVICE_CTRL_CONFIG, &service);
 }
 MSH_CMD_EXPORT(rtlink_dinit, rtlink device interface example);
 

@@ -197,28 +197,14 @@ static void send_cb(struct rt_link_service* service, void* buffer)
     }
 }
 
-static void recv_cb(struct rt_link_service* service, void *data, rt_size_t size)
+static void recv_cb(struct rt_link_service* service, rt_size_t size)
 {
     RT_ASSERT(service != RT_NULL);
     struct rt_link_device *rtlink = (struct rt_link_device *)service->user_data;
 
-    if(rtlink)
+    if((rtlink)&&(rtlink->parent.rx_indicate))
     {
-        struct rtlink_recv_list *node = rt_malloc(sizeof(struct rtlink_recv_list));
-        node->data = data;
-        node->size = size;
-        node->index = 0;
-        rt_slist_append(&rtlink->recv_head, &node->list);
-        rt_link_event_send(service);
-
-        if(rtlink->parent.rx_indicate)
-        {
-            rtlink->parent.rx_indicate(&rtlink->parent, size);
-        }
-    }
-    else
-    {
-        rt_free(data);
+        rtlink->parent.rx_indicate(&rtlink->parent, size);
     }
 }
 
@@ -235,8 +221,15 @@ rt_err_t  rt_link_dev_init(rt_device_t dev)
     rtlink->service.send_cb = RT_NULL;
     rtlink->service.timeout_tx = RT_WAITING_NO;
     rtlink->service.user_data = (void*)dev;
+    rtlink->service.state = RT_LINK_SERVICE_INIT;
 
-    rt_slist_init(&rtlink->recv_head);
+    rtlink->service.rb_flag = 0;
+    rt_ringbuffer_reset(&rtlink->service.send_rb);
+    rt_ringbuffer_reset(&rtlink->service.recv_rb);
+
+    rt_mutex_init(&rtlink->service.send_mutex, rtlink->parent.parent.name, RT_IPC_FLAG_FIFO);
+    rt_mutex_init(&rtlink->service.recv_mutex, rtlink->parent.parent.name, RT_IPC_FLAG_FIFO);
+
     return RT_EOK;
 }
 
